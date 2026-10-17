@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AR Frogger - กบข้ามถนนด้วย AR</title>
+    <!-- โหลด Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- โหลด MediaPipe Pose -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+    
+    <style>
+        body {
+            font-family: 'Kanit', sans-serif;
+            background-color: #1a202c;
+            color: white;
+            overflow: hidden;
+            touch-action: none; /* ป้องกันการเลื่อนหน้าจอ */
+        }
+        
+        #game-container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background: #000;
+        }
+
+        /* ซ่อนวิดีโอต้นฉบับ เพราะเราจะวาดลง Canvas แทน */
+        #webcam-video {
+            display: none;
+        }
+
+        #gameCanvas {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            box-shadow: 0 0 20px rgba(0,255,100,0.2);
+            border-radius: 12px;
+        }
+
+        /* ปรับ UI ซ้อนทับ */
+        .overlay-ui {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* ปุ่มและหน้าต่างที่กดได้ */
+        .interactive {
+            pointer-events: auto;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="game-container">
+        <!-- วิดีโอต้นทางจากกล้อง -->
+        <video id="webcam-video" autoplay playsinline></video>
+        
+        <!-- กระดานวาดเกม -->
+        <canvas id="gameCanvas" width="640" height="480"></canvas>
+
+        <!-- UI ชั้นบนสุด -->
+        <div class="overlay-ui">
+            <!-- แถบคะแนน -->
+            <div id="score-board" class="hidden flex justify-between p-4 bg-gradient-to-b from-black/80 to-transparent">
+                <div class="text-2xl font-bold text-green-400 drop-shadow-md">
+                    คะแนน: <span id="score">0</span>
+                </div>
+                <div class="text-xl text-yellow-300 drop-shadow-md animate-pulse">
+                    🧍‍♂️ กระโดดหน้ากล้องเพื่อข้ามถนน!
+                </div>
+            </div>
+
+            <!-- หน้าจอเริ่มเกม -->
+            <div id="start-screen" class="interactive absolute inset-0 bg-slate-900/90 flex flex-col justify-center items-center p-6 text-center z-50">
+                <div class="text-7xl mb-4">🐸🚗</div>
+                <h1 class="text-4xl font-bold text-green-400 mb-2">AR Frogger</h1>
+                <p class="text-lg text-slate-300 mb-6 max-w-md">
+                    ใช้ร่างกายของคุณเล่นเกม!<br>
+                    ยืนให้กล้องเห็น ถอยหลังนิดหน่อย<br>
+                    และ <b>"กระโดด"</b> เพื่อพากบข้ามถนน
+                </p>
+                <button id="start-btn" class="bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-400 hover:to-emerald-500 text-white font-bold text-2xl py-4 px-12 rounded-full shadow-lg transform transition active:scale-95">
+                    เปิดกล้องและเริ่มเล่น
+                </button>
+            </div>
+
+            <!-- หน้าจอโหลด Model -->
+            <div id="loading-screen" class="hidden interactive absolute inset-0 bg-slate-900/90 flex flex-col justify-center items-center p-6 text-center z-40">
+                <div class="w-16 h-16 border-4 border-green-500 border-t-transparent rounded-full animate-spin mb-4"></div>
+                <h2 class="text-2xl font-bold text-white">กำลังโหลด AI จับการเคลื่อนไหว...</h2>
+                <p class="text-slate-400 mt-2">โปรดรอสักครู่</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ตัวแปรระบบ
+        const videoElement = document.getElementById('webcam-video');
+        const canvasElement = document.getElementById('gameCanvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        
+        const startScreen = document.getElementById('start-screen');
+        const loadingScreen = document.getElementById('loading-screen');
+        const scoreBoard = document.getElementById('score-board');
+        const scoreEl = document.getElementById('score');
+        const startBtn = document.getElementById('start-btn');
+
+        // ตัวแปรเกม
+        let score = 0;
+        const GRID_SIZE = 48; // ขนาดช่อง 48x48 pixel (10 แถว บนจอสูง 480)
+        let isGameRunning = false;
+
+        // ข้อมูลกบ
+        let frog = {
+            x: 640 / 2 - 24, // ตรงกลางแกน X
+            y: 480 - 48,     // แถวล่างสุด
+            size: 40,
+            emoji: '🐸'
+        };
+
+        // ข้อมูลรถ
+        let cars = [];
+        const lanes = [1, 2, 3, 4, 5, 6, 7, 8]; // แถวที่เป็นถนน (0 คือเส้นชัย, 9 คือจุดเริ่ม)
+        const carEmojis = ['🚗', '🚙', '🚕', '🚐', '🚜'];
+
+        // สร้างรถแบบสุ่ม
+        function initCars() {
+            cars = [];
+            for (let i = 0; i < 15; i++) {
+                let lane = lanes[Math.floor(Math.random() * lanes.length)];
+                let direction = (lane % 2 === 0) ? 1 : -1; // สลับทิศทางซ้ายขวาตามเลน
+                cars.push({
+                    x: Math.random() * 640,
+                    y: lane * GRID_SIZE,
+                    speed: (1 + Math.random() * 2.5) * direction,
+                    size: 40,
+                    emoji: carEmojis[Math.floor(Math.random() * carEmojis.length)]
+                });
+            }
+        }
+
+        // รีเซ็ตกบเมื่อเริ่มใหม่ หรือชน
+        function resetFrog() {
+            frog.x = 640 / 2 - 24;
+            frog.y = 480 - 48;
+        }
+
+        // อัปเดตตรรกะเกม (ย้ายรถ และเช็คการชน)
+        function updateGame() {
+            if (!isGameRunning) return;
+
+            // เลื่อนรถ
+            cars.forEach(car => {
+                car.x += car.speed;
+                // ถ้ารถวิ่งทะลุจอ ให้วนกลับมา
+                if (car.speed > 0 && car.x > 640) car.x = -GRID_SIZE;
+                if (car.speed < 0 && car.x < -GRID_SIZE) car.x = 640;
+            });
+
+            // เช็คการชน (Hitbox แบบหยาบๆ)
+            const frogHitbox = { x: frog.x + 10, y: frog.y + 10, w: 20, h: 20 };
+            
+            for (let car of cars) {
+                const carHitbox = { x: car.x + 5, y: car.y + 10, w: 30, h: 20 };
+                
+                if (frogHitbox.x < carHitbox.x + carHitbox.w &&
+                    frogHitbox.x + frogHitbox.w > carHitbox.x &&
+                    frogHitbox.y < carHitbox.y + carHitbox.h &&
+                    frogHitbox.y + frogHitbox.h > carHitbox.y) {
+                    // ชนรถ
+                    playSound('ouch');
+                    resetFrog();
+                    score = Math.max(0, score - 1); // ลดคะแนน แต่ไม่ต่ำกว่า 0 (Optional)
+                    scoreEl.innerText = score;
+                    return;
+                }
+            }
+
+            // เช็คเส้นชัย (แถวบนสุด)
+            if (frog.y <= 0) {
+                playSound('win');
+                score++;
+                scoreEl.innerText = score;
+                resetFrog();
+                // เพิ่มความยาก (เร่งความเร็วรถเล็กน้อย)
+                cars.forEach(c => c.speed *= 1.05);
+            }
+        }
+
+        function drawGame(videoFrame) {
+            // 1. ล้างกระดาน
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+            // 2. วาดภาพจากกล้อง (สลับซ้ายขวาให้เหมือนกระจก)
+            if (videoFrame) {
+                canvasCtx.save();
+                canvasCtx.scale(-1, 1);
+                canvasCtx.drawImage(videoFrame, -canvasElement.width, 0, canvasElement.width, canvasElement.height);
+                canvasCtx.restore();
+            }
+
+            // 3. วาดโซนปลอดภัย (บนสุดและล่างสุด)
+            canvasCtx.fillStyle = 'rgba(0, 255, 100, 0.3)'; // เส้นชัย
+            canvasCtx.fillRect(0, 0, 640, GRID_SIZE);
+            canvasCtx.fillStyle = 'rgba(100, 100, 255, 0.3)'; // จุดเริ่ม
+            canvasCtx.fillRect(0, 480 - GRID_SIZE, 640, GRID_SIZE);
+
+            // 4. วาดรถ
+            canvasCtx.font = "36px Arial";
+            canvasCtx.textAlign = "center";
+            canvasCtx.textBaseline = "middle";
+            cars.forEach(car => {
+                canvasCtx.fillText(car.emoji, car.x + GRID_SIZE/2, car.y + GRID_SIZE/2);
+            });
+
+            // 5. วาดกบ
+            canvasCtx.fillText(frog.emoji, frog.x + GRID_SIZE/2, frog.y + GRID_SIZE/2);
+        }
+
+        // ระบบเสียง (Web Audio API Synthesizer)
+        let audioCtx;
+        function initAudio() {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            if (audioCtx.state === 'suspended') {
+                audioCtx.resume();
+            }
+        }
+
+        function playSound(type) {
+            if (!audioCtx) return;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            const now = audioCtx.currentTime;
+
+            if (type === 'jump') {
+                // เสียงกระโดด Boing
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(300, now);
+                osc.frequency.exponentialRampToValueAtTime(600, now + 0.1);
+                gain.gain.setValueAtTime(0.5, now);
+                gain.gain.exponentialRampToValueAtTime(0.01, now + 0.1);
+                osc.start(now);
+                osc.stop(now + 0.1);
+            } else if (type === 'ouch') {
+                // เสียงชนรถ
+                osc.type = 'sawtooth';
+                osc.frequency.setValueAtTime(100, now);
+                osc.frequency.linearRampToValueAtTime(50, now + 0.2);
+                gain.gain.setValueAtTime(0.5, now);
+                gain.gain.linearRampToValueAtTime(0.01, now + 0.2);
+                osc.start(now);
+                osc.stop(now + 0.2);
+            } else if (type === 'win') {
+                // เสียงผ่านด่าน
+                osc.type = 'square';
+                osc.frequency.setValueAtTime(400, now);
+                osc.frequency.setValueAtTime(600, now + 0.1);
+                gain.gain.setValueAtTime(0.3, now);
+                gain.gain.linearRampToValueAtTime(0.01, now + 0.3);
+                osc.start(now);
+                osc.stop(now + 0.3);
+            }
+        }
+
+        // ระบบจับการเคลื่อนไหวด้วย MediaPipe Pose
+        let previousNoseY = null;
+        let jumpCooldown = 0;
+
+        function onResults(results) {
+            // อัปเดตและวาดเกมเสมอ (แม้ไม่พบคน)
+            updateGame();
+            drawGame(results.image);
+
+            if (!isGameRunning) return;
+
+            // หากพบร่างกายคน
+            if (results.poseLandmarks) {
+                // จุดที่ 0 คือ จมูก (Nose)
+                const nose = results.poseLandmarks[0];
+                
+                if (previousNoseY !== null) {
+                    // ลด Cooldown การกระโดด
+                    if (jumpCooldown > 0) jumpCooldown--;
+
+                    // คำนวณความเร็วในการขยับแกน Y
+                    // ค่า Y ของ MediaPipe คือ 0 (บนสุด) ถึง 1 (ล่างสุด)
+                    // การกระโดดขึ้น = จมูกขยับไปทาง 0 อย่างรวดเร็ว (ค่า Y ลดลง)
+                    const deltaY = previousNoseY - nose.y;
+
+                    // ถ้าค่า Y ลดลงมากกว่า 0.03 ใน 1 เฟรม (กระโดดแรงพอ) และพร้อมกระโดด
+                    if (deltaY > 0.035 && jumpCooldown === 0) {
+                        triggerJump();
+                        jumpCooldown = 15; // หน่วงเวลาไม่ให้กระโดดรัวเกินไป (ประมาน 0.5 วินาทีที่ 30fps)
+                    }
+                }
+                previousNoseY = nose.y;
+            } else {
+                previousNoseY = null;
+            }
+        }
+
+        function triggerJump() {
+            playSound('jump');
+            frog.y -= GRID_SIZE; // กบเดินหน้าขึ้นไป 1 ช่อง
+            
+            // จำกัดไม่ให้กบหลุดขอบจอซ้ายขวา (เผื่อเพิ่มระบบเดินซ้ายขวาในอนาคต)
+            if (frog.y < 0) frog.y = 0; 
+        }
+
+        // การตั้งค่า MediaPipe Pose
+        const pose = new Pose({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`;
+        }});
+        pose.setOptions({
+            modelComplexity: 1,
+            smoothLandmarks: true,
+            enableSegmentation: false,
+            smoothSegmentation: false,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+        pose.onResults(onResults);
+
+        // เริ่มกล้องและเริ่มเกม
+        startBtn.addEventListener('click', async () => {
+            initAudio(); // ปลดล็อกเสียง
+            startScreen.classList.add('hidden');
+            loadingScreen.classList.remove('hidden');
+
+            try {
+                // เริ่มระบบกล้องของ MediaPipe
+                const camera = new Camera(videoElement, {
+                    onFrame: async () => {
+                        await pose.send({image: videoElement});
+                    },
+                    width: 640,
+                    height: 480
+                });
+                
+                await camera.start();
+                
+                // ซ่อนหน้าโหลด และแสดง UI เกม
+                loadingScreen.classList.add('hidden');
+                scoreBoard.classList.remove('hidden');
+                
+                // เตรียมสภาพแวดล้อมเกม
+                initCars();
+                resetFrog();
+                isGameRunning = true;
+                
+            } catch (err) {
+                alert("ไม่สามารถเปิดกล้องได้ โปรดอนุญาตการเข้าถึงกล้อง");
+                console.error(err);
+                loadingScreen.classList.add('hidden');
+                startScreen.classList.remove('hidden');
+            }
+        });
+
+        // ระบบสำรองสำหรับการเทส (ใช้คีย์บอร์ด หรือ แตะจอ)
+        window.addEventListener('keydown', (e) => {
+            if (!isGameRunning) return;
+            if (e.key === 'ArrowUp' || e.key === 'w' || e.key === 'W') {
+                triggerJump();
+            }
+        });
+        window.addEventListener('touchstart', (e) => {
+            if (!isGameRunning) return;
+            // แตะจอเพื่อทดสอบกระโดด
+            if(e.target === canvasElement) {
+                triggerJump();
+            }
+        });
+
+    </script>
+</body>
+</html>
